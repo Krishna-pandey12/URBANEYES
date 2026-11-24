@@ -2022,7 +2022,7 @@ function setupModals() {
 
   // Clear test issues button
   qs("#clearTestIssuesBtn")?.addEventListener("click", async () => {
-    if (!confirm("Are you sure you want to remove all test and dashcam simulation grievances? Baseline municipal data will be kept.")) return;
+    if (!confirm("Are you sure you want to remove all dummy / demo grievances? (You can restore them anytime using Reset Demo Data).")) return;
     toast("Clearing test grievances from database...", "info");
     try {
       const res = await fetch(`${API_ROOT}/issues/clear-test-data`, { method: "POST" });

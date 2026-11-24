@@ -821,7 +821,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     model = get_yolo_model()
     if model is not None:
         try:
-            conf_th = float(os.getenv("YOLO_CONF", "0.03"))
+            conf_th = float(os.getenv("YOLO_CONF", "0.20"))
             try:
                 import torch
                 torch.set_num_threads(1)
@@ -968,14 +968,16 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     p_cnts, _ = cv2.findContours(puddle_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     solid_potholes = []
-    if (not is_footpath_detected and not is_garbage_detected and s_mean < 95) or (has_pothole_hint and not is_garbage_detected and not is_footpath_detected):
-        min_sa = (w * h * 0.008) if (has_pothole_hint or any(d["category"] == "Pothole" for d in detections)) else (w * h * 0.015)
+    if (not is_footpath_detected and not is_garbage_detected and s_mean < 140) or (has_pothole_hint and not is_garbage_detected and not is_footpath_detected):
+        min_sa = (w * h * 0.008)
         for sc in s_cnts:
             sa = cv2.contourArea(sc)
-            if min_sa <= sa < (w * h * 0.50):
+            if min_sa <= sa < (w * h * 0.38):
                 sx, sy, sbw, sbh = cv2.boundingRect(sc)
-                matched_box = [sx, sy, sx + sbw, sy + sbh]
-                matched_area = sa
+                aspect = sbw / float(max(1, sbh))
+                if 0.25 <= aspect <= 3.8:
+                    matched_box = [sx, sy, sx + sbw, sy + sbh]
+                    matched_area = sa
 
                 # Check if this cavity touches or encloses a water puddle directly beneath/overlapping it
                 for pc in p_cnts:
@@ -1185,8 +1187,8 @@ def analyze_path(path: Path, width: int, height: int, filename_hint: str = "", c
         }
 
     HAZARD_WEIGHTS = {
+        "Pothole": 1.60,
         "Traffic signal": 1.25,
-        "Pothole": 1.20,
         "Drainage": 1.15,
         "Streetlight": 1.10,
         "Garbage": 1.10,
@@ -1194,6 +1196,13 @@ def analyze_path(path: Path, width: int, height: int, filename_hint: str = "", c
         "Road crack": 1.05,
         "Road marking": 0.95
     }
+
+    # If both Pothole and Road crack are detected in the same frame,
+    # Pothole is the critical cavity defect and must take precedence over minor perimeter cracks.
+    if any(d.get("category") == "Pothole" for d in detections):
+        for d in detections:
+            if d.get("category") == "Pothole":
+                d["confidence"] = max(float(d.get("confidence", 0.5)), 0.94)
 
     cat_counts = Counter(d.get("category", "") for d in detections)
 
@@ -2261,12 +2270,19 @@ def delete_issue(issue_id: str, x_ue_role: str | None = Header(default=None), x_
 
 @app.post("/api/issues/clear-test-data")
 def clear_test_data() -> dict[str, Any]:
-    """Removes all test and dashcam simulation grievances while preserving baseline seed records."""
+    """Removes all dummy demo and test simulation grievances from the database."""
     with connect() as con:
-        deleted = con.execute("DELETE FROM issues WHERE id LIKE 'UE-261012-%' OR data_json LIKE '%Dashcam Flagged%'").rowcount
+        deleted = con.execute("""
+            DELETE FROM issues 
+            WHERE data_json LIKE '%"isDemo": true%' 
+               OR data_json LIKE '%"isDemo":true%'
+               OR data_json LIKE '%Dashcam%'
+               OR id LIKE 'UE-260%'
+               OR id LIKE 'UE-261012-%'
+        """).rowcount
         con.execute("DELETE FROM tickets WHERE id NOT IN (SELECT id FROM issues)")
-        log_activity(f"Cleared {deleted} test and dashcam simulation issues", con=con)
-    return {"ok": True, "deletedCount": deleted, "message": f"Successfully deleted {deleted} test/dashcam complaints"}
+        log_activity(f"Cleared {deleted} dummy and test issues", con=con)
+    return {"ok": True, "deletedCount": deleted, "message": f"Successfully cleared {deleted} dummy/demo complaints"}
 
 
 @app.post("/api/issues/reset-demo-db")

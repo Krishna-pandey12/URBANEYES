@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/*.db-shm
+data/*.db-wal
+uploads/*
+!uploads/.gitkeep
+models/*.pt
+!models/best.pt
+runs/
+datasets/rdd2022_yolo/images/
+datasets/rdd2022_yolo/labels/

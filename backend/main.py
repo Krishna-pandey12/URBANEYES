@@ -821,7 +821,8 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     model = get_yolo_model()
     if model is not None:
         try:
-            conf_th = float(os.getenv("YOLO_CONF", "0.20"))
+            # Use 0.08 base threshold so D40-Pothole is captured even with moderate confidence
+            conf_th = float(os.getenv("YOLO_CONF", "0.08"))
             try:
                 import torch
                 torch.set_num_threads(1)
@@ -842,6 +843,10 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
                     bh = max(0.0, xyxy[3] - xyxy[1])
                     area_ratio = (bw * bh) / max(1.0, float(w * h))
                     cat = category_from_label(label) or "Road crack"
+
+                    # Filter out weak crack noise, but always keep Pothole detections
+                    if cat != "Pothole" and conf < 0.20:
+                        continue
 
                     # Exclude edge/sensor border artifacts (e.g. extreme top/side camera boundaries)
                     is_border = (xyxy[0] <= 15 and xyxy[2] <= 45) or (xyxy[2] >= w - 15 and xyxy[0] >= w - 50)

@@ -1406,7 +1406,7 @@ async function triggerAiAutoExtract() {
     toast(`AI successfully identified ${data.category} (${data.severity}) across complete frame!`, "success");
   } catch (err) {
     console.error("AI Auto-Extraction failed:", err);
-    toast("AI extraction failed. Please fill manually.", "error");
+    toast(`AI extraction failed: ${err.message || "Server error"}. Please fill manually.`, "error");
   } finally {
     if (btn) {
       btn.disabled = false;

@@ -1336,10 +1336,58 @@ function setupSamplePickers() {
   });
 }
 
+// Lightweight client-side image compressor: scales down massive phone camera images (10MB -> 250KB)
+// Ensures instant upload, zero mobile network latency, and prevents 512MB RAM OOM on Render.
+async function compressImageForUpload(file, maxDim = 1200, quality = 0.85) {
+  if (!file || !file.type || !file.type.startsWith("image/")) return file;
+  if (file.size < 400 * 1024) return file;
+
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+        if (width <= maxDim && height <= maxDim) {
+          return resolve(file);
+        }
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              const compressed = new File([blob], file.name || "evidence.jpg", { type: "image/jpeg" });
+              resolve(compressed);
+            } else {
+              resolve(file);
+            }
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target.result;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
+}
+
 // Trigger AI Auto-Extraction from image
 async function triggerAiAutoExtract() {
-  const file = state.selectedReportFile || qs("#reportFileInput")?.files?.[0];
-  if (!file) {
+  const rawFile = state.selectedReportFile || qs("#reportFileInput")?.files?.[0];
+  if (!rawFile) {
     toast("Select or take a photo first.", "error");
     return;
   }
@@ -1347,10 +1395,11 @@ async function triggerAiAutoExtract() {
   const btn = qs("#aiAutoExtractBtn");
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "✨ Analyzing Full Image with AI...";
+    btn.textContent = "✨ Analyzing with AI...";
   }
 
   try {
+    const file = await compressImageForUpload(rawFile);
     const form = new FormData();
     form.append("file", file);
     form.append("location_hint", qs("#reportLocation")?.value || "");
@@ -1360,10 +1409,20 @@ async function triggerAiAutoExtract() {
       form.append("category_hint", categoryHint);
     }
 
-    const res = await fetch(`${API_ROOT}/ai-extract-report`, {
+    let res = await fetch(`${API_ROOT}/ai-extract-report`, {
       method: "POST",
       body: form
     });
+
+    // Auto-retry once if server was waking up from Render free-tier cold sleep
+    if (res.status === 502 || res.status === 503 || res.status === 504) {
+      if (btn) btn.textContent = "⏳ Server waking up, retrying in 3s...";
+      await new Promise(r => setTimeout(r, 3000));
+      res = await fetch(`${API_ROOT}/ai-extract-report`, {
+        method: "POST",
+        body: form
+      });
+    }
 
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();

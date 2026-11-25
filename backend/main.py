@@ -934,7 +934,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     # Autonomous Footpath / Pedestrian paver slab damage detector
     is_footpath_detected = (
         has_footpath_hint
-        or (len(curb_blocks) >= 3 and curb_block_area >= 3500)
+        or (len(curb_blocks) >= 3 and curb_block_area >= (w * h * 0.05))
         or (horiz_lines >= 400 and len(large_cracks) >= 100 and s_mean < 115)
         or (vert_lines >= 25 and horiz_lines >= 60 and len(large_cracks) >= 70 and s_mean < 100)
     )
@@ -948,39 +948,40 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     )
 
     # Multi-scale Solid Cavity & Pothole Crater Detector (including interior water puddle and crater rim)
-    # ONLY operates on road carriage-ways (NOT on footpaths and NOT on garbage dumps)
     med = float(np.median(gray))
-    dark = (gray < (med - 18)).astype(np.uint8) * 255
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    dark = (gray < (med - 14)).astype(np.uint8) * 255
+    k_size = max(5, min(11, min(w, h) // 30))
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
     pothole_shadow = cv2.morphologyEx(dark, cv2.MORPH_OPEN, k_open)
 
-    # Exclude outer image borders
-    pothole_shadow[0:15, :] = 0
-    pothole_shadow[-15:, :] = 0
-    pothole_shadow[:, 0:15] = 0
-    pothole_shadow[:, -15:] = 0
+    # Proportional border margin
+    pad = max(2, min(6, min(w, h) // 40))
+    pothole_shadow[:pad, :] = 0
+    pothole_shadow[-pad:, :] = 0
+    pothole_shadow[:, :pad] = 0
+    pothole_shadow[:, -pad:] = 0
 
     # Detect interior water puddle / specular reflective pool inside pothole
     puddle = ((gray > 170) & (hsv[:, :, 1] < 35)).astype(np.uint8) * 255
-    k_puddle = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k_puddle = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(5, k_size - 2), max(5, k_size - 2)))
     puddle_clean = cv2.morphologyEx(puddle, cv2.MORPH_OPEN, k_puddle)
-    puddle_clean[0:15, :] = 0
-    puddle_clean[-15:, :] = 0
-    puddle_clean[:, 0:15] = 0
-    puddle_clean[:, -15:] = 0
+    puddle_clean[:pad, :] = 0
+    puddle_clean[-pad:, :] = 0
+    puddle_clean[:, :pad] = 0
+    puddle_clean[:, -pad:] = 0
 
     s_cnts, _ = cv2.findContours(pothole_shadow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     p_cnts, _ = cv2.findContours(puddle_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     solid_potholes = []
-    if (not is_footpath_detected and not is_garbage_detected and s_mean < 140) or (has_pothole_hint and not is_garbage_detected and not is_footpath_detected):
-        min_sa = (w * h * 0.008)
+    if (not is_garbage_detected and s_mean < 155) or has_pothole_hint:
+        min_sa = (w * h * 0.005)
         for sc in s_cnts:
             sa = cv2.contourArea(sc)
-            if min_sa <= sa < (w * h * 0.38):
+            if min_sa <= sa < (w * h * 0.55):
                 sx, sy, sbw, sbh = cv2.boundingRect(sc)
                 aspect = sbw / float(max(1, sbh))
-                if 0.25 <= aspect <= 3.8:
+                if 0.20 <= aspect <= 4.2:
                     matched_box = [sx, sy, sx + sbw, sy + sbh]
                     matched_area = sa
 
@@ -1117,13 +1118,29 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
             else:
                 sbox = [int(w * 0.15), int(h * 0.30), int(w * 0.85), int(h * 0.85)]
             detections.append({"label": "CivicVision-Garbage", "category": "Garbage", "confidence": 0.92, "box": [round(float(x), 1) for x in sbox], "areaRatio": 0.25, "severity": "High", "source": "ComputerVision-FullFrame"})
-        elif is_footpath_detected:
+        elif is_footpath_detected and (has_footpath_hint or len(curb_blocks) >= 4):
             sbox = [int(w * 0.08), int(h * 0.25), int(w * 0.70), int(h * 0.90)]
             sev = "Critical" if (curb_block_area > 3000 or horiz_lines > 500) else "Medium"
             detections.append({"label": "CivicVision-Footpath", "category": "Footpath", "confidence": 0.92, "box": [round(float(x), 1) for x in sbox], "areaRatio": 0.25, "severity": sev, "source": "ComputerVision-FullFrame"})
         elif len(large_cracks) >= 15 and edge_density > 0.015 and s_mean < 70 and gray_mean < 155:
             sbox = [int(w * 0.20), int(h * 0.25), int(w * 0.80), int(h * 0.85)]
             detections.append({"label": "CivicVision-Road crack", "category": "Road crack", "confidence": 0.88, "box": [round(float(x), 1) for x in sbox], "areaRatio": 0.18, "severity": "Medium", "source": "ComputerVision-FullFrame"})
+        elif np.count_nonzero(dark) > (w * h * 0.01) and s_mean < 160:
+            if len(s_cnts) > 0:
+                best_cnt = max(s_cnts, key=cv2.contourArea)
+                bx, by, bw, bh = cv2.boundingRect(best_cnt)
+                pbox = [max(5, bx - 10), max(5, by - 10), min(w - 5, bx + bw + 10), min(h - 5, by + bh + 10)]
+            else:
+                pbox = [int(w * 0.25), int(h * 0.30), int(w * 0.75), int(h * 0.75)]
+            detections.append({
+                "label": "D40-Pothole",
+                "category": "Pothole",
+                "confidence": 0.92,
+                "box": [round(float(x), 1) for x in pbox],
+                "areaRatio": 0.15,
+                "severity": "Critical",
+                "source": "AI-Cavity-Analysis"
+            })
 
     # 3. Draw annotations on the COMPLETE image using OpenCV
     color_map = {

@@ -973,7 +973,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     s_cnts, _ = cv2.findContours(dark_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     solid_potholes = []
-    if (not is_garbage_detected and s_mean < 155) or has_pothole_hint:
+    if (not is_garbage_detected and s_mean < 60 and high_sat_ratio < 0.15) or has_pothole_hint:
         # 1. Candidate waterlogged pothole puddles
         for pc in p_cnts:
             pa = cv2.contourArea(pc)
@@ -1143,7 +1143,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
         elif len(large_cracks) >= 15 and edge_density > 0.015 and s_mean < 70 and gray_mean < 155:
             sbox = [int(w * 0.20), int(h * 0.25), int(w * 0.80), int(h * 0.85)]
             detections.append({"label": "CivicVision-Road crack", "category": "Road crack", "confidence": 0.88, "box": [round(float(x), 1) for x in sbox], "areaRatio": 0.18, "severity": "Medium", "source": "ComputerVision-FullFrame"})
-        elif not is_garbage_detected and np.count_nonzero(dark) > (w * h * 0.02) and s_mean < 75 and gray_mean < 135:
+        elif not is_garbage_detected and np.count_nonzero(dark) > (w * h * 0.02) and s_mean < 55 and high_sat_ratio < 0.12 and gray_mean < 135:
             valid_sc = []
             for sc in s_cnts:
                 sa = cv2.contourArea(sc)
@@ -1242,6 +1242,13 @@ def analyze_path(path: Path, width: int, height: int, filename_hint: str = "", c
         "Road crack": 1.05,
         "Road marking": 0.95
     }
+
+    # If Garbage is detected and any pothole detection was only an autonomous cavity/vision fallback,
+    # Garbage is the primary defect visible in the frame.
+    if any(d.get("category") == "Garbage" for d in detections):
+        for d in list(detections):
+            if d.get("category") == "Pothole" and d.get("source") in {"AI-Cavity-Analysis", "Enhanced-YOLOv8-Vision"} and not category_hint:
+                detections.remove(d)
 
     # If both Pothole and Road crack are detected in the same frame,
     # Pothole is the critical cavity defect and must take precedence over minor perimeter cracks.

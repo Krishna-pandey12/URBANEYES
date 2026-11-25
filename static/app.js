@@ -1403,11 +1403,8 @@ async function triggerAiAutoExtract() {
     const form = new FormData();
     form.append("file", file);
     form.append("location_hint", qs("#reportLocation")?.value || "");
-    const categorySelect = qs("#reportCategory");
-    const categoryHint = (state.userSelectedCategory && categorySelect?.value) ? categorySelect.value : "";
-    if (categoryHint) {
-      form.append("category_hint", categoryHint);
-    }
+    // Note: Never send category dropdown as hint during AI Auto-Extraction.
+    // The AI extraction must autonomously evaluate the image evidence without feedback loop bias.
 
     let res = await fetch(`${API_ROOT}/ai-extract-report`, {
       method: "POST",

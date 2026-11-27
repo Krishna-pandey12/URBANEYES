@@ -1384,6 +1384,102 @@ async function compressImageForUpload(file, maxDim = 1200, quality = 0.85) {
   });
 }
 
+const CATEGORY_CLIENT_ROUTING = {
+  "Pothole": {
+    dept: "Roads & Infrastructure / PWD",
+    sla: "8h",
+    cost: "₹5,200",
+    severity: "High",
+    title: "Deep road surface pothole creating vehicle collision & rim hazard",
+    desc: "Road surface pothole failure requiring excavation, tack coat, and warm-mix asphalt compaction."
+  },
+  "Road crack": {
+    dept: "Roads & Infrastructure / PWD",
+    sla: "24h",
+    cost: "₹3,500",
+    severity: "Medium",
+    title: "Structural asphalt fatigue cracking propagating along carriage-way",
+    desc: "Asphalt fatigue cracking requiring hot-applied elastomeric bitumen sealant to prevent water infiltration."
+  },
+  "Streetlight": {
+    dept: "Electricity & Streetlight Dept",
+    sla: "24h",
+    cost: "₹2,500",
+    severity: "Medium",
+    title: "Non-operational / damaged streetlight fixture creating dark zone",
+    desc: "Damaged or malfunctioning street luminaire creating pedestrian safety and night visibility hazard."
+  },
+  "Garbage": {
+    dept: "Sanitation & Waste Management",
+    sla: "12h",
+    cost: "₹1,800",
+    severity: "High",
+    title: "Uncollected roadside municipal solid waste accumulation",
+    desc: "Solid waste dump obstructing pedestrian shoulder requiring municipal collection and sanitation clearance."
+  },
+  "Drainage": {
+    dept: "Water Supply & Sewerage Board",
+    sla: "12h",
+    cost: "₹4,500",
+    severity: "High",
+    title: "Blocked stormwater drain inlet causing standing street waterlogging",
+    desc: "Stormwater drain choke causing localized road water accumulation and pedestrian disruption."
+  },
+  "Footpath": {
+    dept: "Urban Local Body (ULB)",
+    sla: "48h",
+    cost: "₹3,000",
+    severity: "Medium",
+    title: "Broken pedestrian paver slabs creating uneven tripping hazard",
+    desc: "Displaced and fractured sidewalk pavers creating tripping hazard for pedestrians."
+  },
+  "Traffic signal": {
+    dept: "Traffic Police & Urban Signals",
+    sla: "4h",
+    cost: "₹6,500",
+    severity: "Critical",
+    title: "Malfunctioning intersection traffic signal head creating collision risk",
+    desc: "Faulty traffic signal controller causing intersection traffic deadlock and vehicle conflict risk."
+  },
+  "Road marking": {
+    dept: "Traffic Police & Urban Signals",
+    sla: "72h",
+    cost: "₹2,200",
+    severity: "Low",
+    title: "Severely faded lane divider marking causing traffic swerving",
+    desc: "Faded lane striping requiring thermoplastic reflective re-application."
+  }
+};
+
+function syncReportCategoryRouting(cat) {
+  if (!cat || !CATEGORY_CLIENT_ROUTING[cat]) return;
+  const info = CATEGORY_CLIENT_ROUTING[cat];
+  if (qs("#routedDeptName")) qs("#routedDeptName").textContent = info.dept;
+  if (qs("#routedSla")) qs("#routedSla").textContent = info.sla;
+  if (qs("#routedCost")) qs("#routedCost").textContent = info.cost;
+  if (qs("#reportSeverity") && (!qs("#reportSeverity").value || qs("#reportSeverity").value === "Medium")) {
+    qs("#reportSeverity").value = info.severity;
+  }
+  if (qs("#reportTitle") && !qs("#reportTitle").value.trim()) {
+    qs("#reportTitle").value = info.title;
+  }
+  if (qs("#reportDescription") && !qs("#reportDescription").value.trim()) {
+    qs("#reportDescription").value = info.desc;
+  }
+}
+
+function resetReportAiState() {
+  state.reportAiCounter = (state.reportAiCounter || 0) + 1;
+  state.userSelectedCategory = false;
+  if (qs("#reportTitle")) qs("#reportTitle").value = "";
+  if (qs("#reportCategory")) qs("#reportCategory").value = "";
+  if (qs("#reportSeverity")) qs("#reportSeverity").value = "Medium";
+  if (qs("#reportDescription")) qs("#reportDescription").value = "";
+  if (qs("#routedDeptName")) qs("#routedDeptName").textContent = "Select category above to assign authority";
+  if (qs("#routedSla")) qs("#routedSla").textContent = "—";
+  if (qs("#routedCost")) qs("#routedCost").textContent = "—";
+}
+
 // Trigger AI Auto-Extraction from image
 async function triggerAiAutoExtract() {
   const rawFile = state.selectedReportFile || qs("#reportFileInput")?.files?.[0];
@@ -1391,6 +1487,8 @@ async function triggerAiAutoExtract() {
     toast("Select or take a photo first.", "error");
     return;
   }
+
+  const currentRequestId = ++state.reportAiCounter;
 
   const btn = qs("#aiAutoExtractBtn");
   if (btn) {
@@ -1403,8 +1501,6 @@ async function triggerAiAutoExtract() {
     const form = new FormData();
     form.append("file", file);
     form.append("location_hint", qs("#reportLocation")?.value || "");
-    // Note: Never send category dropdown as hint during AI Auto-Extraction.
-    // The AI extraction must autonomously evaluate the image evidence without feedback loop bias.
 
     let res = await fetch(`${API_ROOT}/ai-extract-report`, {
       method: "POST",
@@ -1421,18 +1517,35 @@ async function triggerAiAutoExtract() {
       });
     }
 
+    if (state.reportAiCounter !== currentRequestId) {
+      return; // A newer request has taken over; drop this stale response
+    }
+
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
-    if (!data.detected) {
-      if (qs("#previewResolutionText")) {
-        qs("#previewResolutionText").textContent = "No automated defect detected • Select category manually";
-      }
-      toast(data.message || "No obvious infrastructure defect detected. Please capture closer imagery or choose defect category manually.", "info");
+    if (state.reportAiCounter !== currentRequestId) {
       return;
     }
 
-    // Autofill form
+    if (!data.detected) {
+      // Clear form and display clean unclassified guidance
+      if (qs("#reportTitle")) qs("#reportTitle").value = "";
+      if (qs("#reportCategory")) qs("#reportCategory").value = "";
+      if (qs("#reportSeverity")) qs("#reportSeverity").value = "Medium";
+      if (qs("#reportDescription")) qs("#reportDescription").value = "";
+      if (qs("#routedDeptName")) qs("#routedDeptName").textContent = "Select category above to assign authority";
+      if (qs("#routedSla")) qs("#routedSla").textContent = "—";
+      if (qs("#routedCost")) qs("#routedCost").textContent = "—";
+
+      if (qs("#previewResolutionText")) {
+        qs("#previewResolutionText").textContent = "⚠️ Unclassified Defect • Please Select Category Manually";
+      }
+      toast(data.message || "Defect could not be reliably classified by model. Please choose defect category manually.", "info");
+      return;
+    }
+
+    // Synchronize entire grievance report atomically with AI prediction
     if (qs("#reportTitle")) qs("#reportTitle").value = data.title;
     if (qs("#reportCategory")) qs("#reportCategory").value = data.category;
     if (qs("#reportSeverity")) qs("#reportSeverity").value = data.severity;
@@ -1461,10 +1574,12 @@ async function triggerAiAutoExtract() {
 
     toast(`AI successfully identified ${data.category} (${data.severity}) across complete frame!`, "success");
   } catch (err) {
-    console.error("AI Auto-Extraction failed:", err);
-    toast(`AI extraction failed: ${err.message || "Server error"}. Please fill manually.`, "error");
+    if (state.reportAiCounter === currentRequestId) {
+      console.error("AI Auto-Extraction failed:", err);
+      toast(`AI extraction failed: ${err.message || "Server error"}. Please fill manually.`, "error");
+    }
   } finally {
-    if (btn) {
+    if (btn && state.reportAiCounter === currentRequestId) {
       btn.disabled = false;
       btn.textContent = "✨ Auto-Extract with AI";
     }
@@ -1481,10 +1596,7 @@ function setupReportForm() {
     const file = e.target.files?.[0];
     if (file) {
       state.selectedReportFile = file;
-      state.userSelectedCategory = false;
-      if (qs("#reportCategory")) qs("#reportCategory").value = "";
-      if (qs("#reportTitle")) qs("#reportTitle").value = "";
-      if (qs("#reportDescription")) qs("#reportDescription").value = "";
+      resetReportAiState();
       qs("#reportFileName").textContent = file.name;
       const reader = new FileReader();
       reader.onload = (ev) => {
@@ -1493,7 +1605,7 @@ function setupReportForm() {
         const img = new Image();
         img.onload = () => {
           if (qs("#previewResolutionText")) {
-            qs("#previewResolutionText").textContent = `${img.naturalWidth} × ${img.naturalHeight} px (Full Uncropped Frame)`;
+            qs("#previewResolutionText").textContent = `${img.naturalWidth} × ${img.naturalHeight} px (Evaluating Full Frame...)`;
           }
         };
         img.src = ev.target.result;
@@ -1508,8 +1620,7 @@ function setupReportForm() {
 
   qs("#clearEvidenceBtn")?.addEventListener("click", () => {
     state.selectedReportFile = null;
-    state.userSelectedCategory = false;
-    if (qs("#reportCategory")) qs("#reportCategory").value = "";
+    resetReportAiState();
     qs("#reportFileInput").value = "";
     qs("#reportFileName").textContent = "JPG, PNG, MP4 supported up to 50MB";
     qs("#reportEvidencePreview").style.display = "none";
@@ -1518,6 +1629,7 @@ function setupReportForm() {
 
   qs("#reportCategory")?.addEventListener("change", (e) => {
     state.userSelectedCategory = !!e.target.value;
+    syncReportCategoryRouting(e.target.value);
   });
 
   // Submit report

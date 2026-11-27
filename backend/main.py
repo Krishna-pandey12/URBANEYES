@@ -718,8 +718,10 @@ def get_yolo_model():
     if not MODEL_PATH.exists():
         return None
     try:
-        if "YOLO_CONFIG_DIR" not in os.environ:
-            os.environ["YOLO_CONFIG_DIR"] = "/tmp/ultralytics"
+        import tempfile
+        temp_dir = str(Path(tempfile.gettempdir()) / "ultralytics_cfg")
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+        os.environ["YOLO_CONFIG_DIR"] = temp_dir
         try:
             import torch
             torch.set_num_threads(1)
@@ -758,18 +760,16 @@ def category_from_label(label: str) -> str | None:
     return None
 
 
-def severity_from_detection(area_ratio: float, confidence: float, category: str = "Pothole") -> str:
-    # High-hazard categories scale faster
-    cat_multiplier = 1.0
-    if category in {"Traffic signal", "Drainage", "Pothole"}:
-        cat_multiplier = 1.3
+def severity_from_detection(area_ratio: float, confidence: float = 0.0, category: str = "Pothole") -> str:
+    # Severity reflects the physical size and scale of the defect, not model confidence
+    cat_multiplier = 1.2 if category in {"Traffic signal", "Drainage", "Pothole"} else 1.0
     adjusted_area = area_ratio * cat_multiplier
 
-    if adjusted_area >= 0.15 or (adjusted_area >= 0.08 and confidence >= 0.85):
+    if adjusted_area >= 0.12:
         return "Critical"
-    if adjusted_area >= 0.06 or confidence >= 0.88:
+    if adjusted_area >= 0.04:
         return "High"
-    if adjusted_area >= 0.02:
+    if adjusted_area >= 0.015:
         return "Medium"
     return "Low"
 
@@ -884,6 +884,14 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     s_mean = float(np.mean(s_ch))
     gray_mean = float(np.mean(gray))
 
+    # Scene context gatekeeper: check sky vs road distribution
+    sky_mask = (gray[:int(0.45 * h)] > 135) & (s_ch[:int(0.45 * h)] < 40)
+    sky_ratio = float(np.mean(sky_mask))
+    road_mask = (s_ch[int(0.22 * h):] < 60) & (gray[int(0.22 * h):] > 20) & (gray[int(0.22 * h):] < 165)
+    road_ratio = float(np.mean(road_mask))
+    is_road_scene = (road_ratio >= 0.12 or (road_ratio >= 0.08 and sky_ratio < 0.35))
+    logger.info(f"[AI_INSPECT] Scene context: sky_ratio={sky_ratio:.3f}, road_ratio={road_ratio:.3f}, is_road_scene={is_road_scene}")
+
     # Ground region analysis (lower 78% of frame where road, footpaths and waste lie)
     ground_y = int(h * 0.22)
     g_hsv = hsv[ground_y:, :]
@@ -892,7 +900,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     g_h = g_hsv[:, :, 0]
     g_gray = gray[ground_y:, :]
     g_med = float(np.median(g_gray))
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     # A. Solid Waste & Plastic Debris Detection
     plastic_mask = (g_s > 45) & (g_v > 35) & ~((g_h >= 12) & (g_h <= 85))
@@ -901,11 +909,8 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     blue_mask = (g_s > 40) & (g_v > 35) & (g_h >= 95) & (g_h <= 135)
     sat_mask = (s_ch > 45) & (v_ch > 40)
     color_entropy = float(np.std(h_ch[sat_mask])) if np.count_nonzero(sat_mask) > (w * h * 0.02) else 0.0
-    high_sat_ratio = float(np.mean(sat_mask))
-
-    hint_str = f"{filename_hint}".lower()
     has_garbage_colors = (plastic_ratio > 0.16) or (plastic_ratio > 0.10 and np.mean(red_mask) > 0.03 and np.mean(blue_mask) > 0.02)
-    is_garbage_scene = has_garbage_colors or ("garbage" in hint_str or "waste" in hint_str or "dump" in hint_str)
+    is_garbage_scene = is_road_scene and (has_garbage_colors or ("garbage" in filename_hint.lower() or "waste" in filename_hint.lower()))
 
     # B. Footpath / Pedestrian Paver Grid & Curb Detection
     puddle = ((g_gray > 125) & (g_s < 45) & (g_gray > g_med + 15)).astype(np.uint8) * 255
@@ -916,47 +921,72 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
     curb_cnts, _ = cv2.findContours(yellow_curb.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     curb_blocks = [c for c in curb_cnts if cv2.contourArea(c) > 250 and (0.35 <= (cv2.boundingRect(c)[2] / max(1, cv2.boundingRect(c)[3])) <= 3.0)]
     curb_block_area = sum(cv2.contourArea(c) for c in curb_blocks)
-    is_footpath_scene = (len(paver_tiles) >= 8) or (len(curb_blocks) >= 4 and curb_block_area > (w * h * 0.04)) or ("footpath" in hint_str and len(paver_tiles) >= 3)
+    is_footpath_scene = is_road_scene and ((len(paver_tiles) >= 8) or (len(curb_blocks) >= 4 and curb_block_area > (w * h * 0.04)))
 
-    # C. Potholes (Waterlogged Puddles & Asphalt Cavities on Roadway)
-    dark_cavity = (g_gray < (g_med - 16)).astype(np.uint8) * 255
-    dark_clean = cv2.morphologyEx(dark_cavity, cv2.MORPH_OPEN, k_open)
-    dc_cnts, _ = cv2.findContours(dark_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+    # C. Potholes: water reflections or dark asphalt cavities on ROADWAY
     valid_potholes = []
-    for c in p_cnts:
-        area = cv2.contourArea(c)
-        if (w * h * 0.007) <= area <= (w * h * 0.40):
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bh < (h * 0.55) and bw < (w * 0.85) and not is_footpath_scene:
-                valid_potholes.append({"contour": c, "type": "puddle", "area": area, "bbox": (bx, by + ground_y, bw, bh)})
-    for c in dc_cnts:
-        area = cv2.contourArea(c)
-        if (w * h * 0.008) <= area <= (w * h * 0.40):
-            bx, by, bw, bh = cv2.boundingRect(c)
-            if bh < (h * 0.55) and bw < (w * 0.85) and not is_footpath_scene:
-                valid_potholes.append({"contour": c, "type": "cavity", "area": area, "bbox": (bx, by + ground_y, bw, bh)})
+    if is_road_scene and not is_footpath_scene and not is_garbage_scene:
+        # Puddle reflections
+        for c in p_cnts:
+            area = cv2.contourArea(c)
+            if (w * h * 0.007) <= area <= (w * h * 0.35):
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = bw / float(max(1, bh))
+                if 0.40 <= aspect <= 3.0 and bh < (h * 0.55) and bw < (w * 0.85):
+                    # Measure interior vs rim contrast to eliminate uniform road glare
+                    mask_in = np.zeros(g_gray.shape, dtype=np.uint8)
+                    cv2.drawContours(mask_in, [c], -1, 255, -1)
+                    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                    mask_rim = cv2.subtract(cv2.dilate(mask_in, k_rim), mask_in)
+                    in_mean = float(np.mean(g_gray[mask_in > 0])) if np.any(mask_in) else 0.0
+                    rim_mean = float(np.mean(g_gray[mask_rim > 0])) if np.any(mask_rim) else 0.0
+                    contrast = abs(in_mean - rim_mean)
+                    if contrast >= 14.0:
+                        score = area * contrast / (1.0 + max(0.0, aspect - 1.2))
+                        valid_potholes.append({
+                            "contour": c, "type": "puddle", "area": area,
+                            "bbox": (bx, by + ground_y, bw, bh), "contrast": contrast, "score": score
+                        })
 
-    # D. Cracks (Structural Canny fractures)
-    canny = cv2.Canny(gray, 40, 140)
-    crack_cnts, _ = cv2.findContours(canny, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    large_cracks = [c for c in crack_cnts if cv2.contourArea(c) > 60 or cv2.arcLength(c, False) > 40]
+        # Dark cavities
+        dark_cavity = (g_gray < max(25, int(g_med - 18))).astype(np.uint8) * 255
+        dark_clean = cv2.morphologyEx(dark_cavity, cv2.MORPH_OPEN, k_open)
+        dc_cnts, _ = cv2.findContours(dark_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in dc_cnts:
+            area = cv2.contourArea(c)
+            if (w * h * 0.008) <= area <= (w * h * 0.35):
+                bx, by, bw, bh = cv2.boundingRect(c)
+                aspect = bw / float(max(1, bh))
+                if 0.40 <= aspect <= 3.0 and bh < (h * 0.55) and bw < (w * 0.85):
+                    mask_in = np.zeros(g_gray.shape, dtype=np.uint8)
+                    cv2.drawContours(mask_in, [c], -1, 255, -1)
+                    k_rim = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                    mask_rim = cv2.subtract(cv2.dilate(mask_in, k_rim), mask_in)
+                    in_mean = float(np.mean(g_gray[mask_in > 0])) if np.any(mask_in) else 0.0
+                    rim_mean = float(np.mean(g_gray[mask_rim > 0])) if np.any(mask_rim) else 0.0
+                    contrast = abs(in_mean - rim_mean)
+                    if contrast >= 14.0:
+                        score = area * contrast / (1.0 + max(0.0, aspect - 1.2))
+                        valid_potholes.append({
+                            "contour": c, "type": "cavity", "area": area,
+                            "bbox": (bx, by + ground_y, bw, bh), "contrast": contrast, "score": score
+                        })
 
-    # E. Vertical Structures (Streetlight / Signal)
-    vert_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, max(15, h // 25)))
-    vert_edges = cv2.morphologyEx(gray, cv2.MORPH_OPEN, vert_k)
-    v_cnts, _ = cv2.findContours(vert_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    tall_posts = [c for c in v_cnts if cv2.boundingRect(c)[3] > (h * 0.35)]
+    # D. Cracks (Structural Canny fractures on road surface)
+    large_cracks = []
+    if is_road_scene:
+        canny = cv2.Canny(gray, 40, 140)
+        crack_cnts, _ = cv2.findContours(canny, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        large_cracks = [c for c in crack_cnts if cv2.contourArea(c) > 60 or cv2.arcLength(c, False) > 40]
 
     logger.info(
-        f"[AI_INSPECT] Features: plastic_ratio={plastic_ratio:.3f}, color_entropy={color_entropy:.1f}, "
-        f"potholes={len(valid_potholes)}, paver_tiles={len(paver_tiles)}, curb_blocks={len(curb_blocks)}, "
-        f"large_cracks={len(large_cracks)}, tall_posts={len(tall_posts)}"
+        f"[AI_INSPECT] Features: plastic_ratio={plastic_ratio:.3f}, potholes={len(valid_potholes)}, "
+        f"paver_tiles={len(paver_tiles)}, curb_blocks={len(curb_blocks)}, large_cracks={len(large_cracks)}"
     )
 
-    # 3. Rule-based CV Detections if YOLO did not detect or for non-YOLO categories:
-    # Priority A: Garbage (Never confuse garbage with footpath or pothole)
-    if is_garbage_scene and not (len(valid_potholes) >= 2 and plastic_ratio < 0.12) and not any(d["category"] == "Garbage" for d in detections):
+    # 3. Rule-based Detections if YOLO did not detect
+    # Priority A: Garbage on ground/roadside
+    if is_garbage_scene and not any(d["category"] == "Garbage" for d in detections):
         waste_k = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         waste_clean = cv2.morphologyEx(plastic_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, waste_k)
         w_cnts, _ = cv2.findContours(waste_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -970,9 +1000,9 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
         else:
             sbox = [int(w * 0.10), int(h * 0.25), int(w * 0.90), int(h * 0.88)]
             c_area = float((sbox[2] - sbox[0]) * (sbox[3] - sbox[1]))
-        conf = round(min(0.95, max(0.68, 0.65 + min(0.25, plastic_ratio * 0.9))), 2)
+        conf = round(min(0.92, max(0.68, 0.65 + min(0.25, plastic_ratio * 0.9))), 2)
         area_r = c_area / float(w * h)
-        sev = "Critical" if area_r > 0.30 else "High" if area_r > 0.15 else "Medium"
+        sev = severity_from_detection(area_r, conf, "Garbage")
         detections.append({
             "label": "CivicVision-Garbage",
             "category": "Garbage",
@@ -984,7 +1014,7 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
         })
         logger.info(f"[AI_INSPECT] Added Garbage detection: conf={conf}, box={sbox}, sev={sev}")
 
-    # Priority B: Footpath (Verified curb blocks or interlocking paver tiles, NOT asphalt road)
+    # Priority B: Footpath (Pedestrian paver grid or curb blocks)
     elif is_footpath_scene and not is_garbage_scene and not any(d["category"] == "Footpath" for d in detections):
         if paver_tiles:
             all_pts = np.concatenate(paver_tiles)
@@ -993,30 +1023,31 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
             sbox = [max(5, px), max(5, py), min(w - 5, px + pw), min(h - 5, py + ph)]
         else:
             sbox = [int(w * 0.08), int(h * 0.30), int(w * 0.70), int(h * 0.90)]
-        conf = round(min(0.92, max(0.65, 0.62 + min(0.25, len(paver_tiles) * 0.02))), 2)
-        sev = "Critical" if (curb_block_area > 3000 or len(paver_tiles) > 15) else "Medium"
+        conf = round(min(0.88, max(0.65, 0.62 + min(0.25, len(paver_tiles) * 0.02))), 2)
+        area_r = 0.20
+        sev = severity_from_detection(area_r, conf, "Footpath")
         detections.append({
             "label": "CivicVision-Footpath",
             "category": "Footpath",
             "confidence": conf,
             "box": [round(float(x), 1) for x in sbox],
-            "areaRatio": 0.25,
+            "areaRatio": area_r,
             "severity": sev,
             "source": "ComputerVision-FullFrame"
         })
         logger.info(f"[AI_INSPECT] Added Footpath detection: conf={conf}, box={sbox}, sev={sev}")
 
-    # Priority C: Potholes on Road Surface
-    elif valid_potholes and not is_garbage_scene and not is_footpath_scene:
-        valid_potholes.sort(key=lambda p: p["area"], reverse=True)
+    # Priority C: Potholes on Road Surface (Ranked by area * contrast score)
+    elif valid_potholes and is_road_scene and not is_garbage_scene and not is_footpath_scene:
+        valid_potholes.sort(key=lambda p: p["score"], reverse=True)
         primary = valid_potholes[0]
         bx, by, bw, bh = primary["bbox"]
-        pad_x = max(8, int(bw * 0.10))
-        pad_y = max(6, int(bh * 0.08))
+        pad_x = max(6, int(bw * 0.08))
+        pad_y = max(5, int(bh * 0.06))
         fbox = [max(5, bx - pad_x), max(5, by - pad_y), min(w - 5, bx + bw + pad_x), min(h - 5, by + bh + pad_y)]
-        area_r = primary["area"] / float(w * h)
-        conf = round(min(0.95, max(0.68, 0.70 + min(0.20, area_r * 3.0))), 2)
-        sev = "Critical" if area_r > 0.05 else "High" if area_r > 0.02 else "Medium"
+        area_r = float(bw * bh) / float(w * h)
+        conf = round(min(0.90, max(0.68, 0.70 + min(0.18, primary["contrast"] / 100.0))), 2)
+        sev = severity_from_detection(area_r, conf, "Pothole")
         if not any(d["category"] == "Pothole" for d in detections):
             detections.append({
                 "label": "D40-Pothole",
@@ -1025,68 +1056,26 @@ def detect_civic_defects(img_path: Path, width: int, height: int, filename_hint:
                 "box": [round(float(x), 1) for x in fbox],
                 "areaRatio": round(area_r, 4),
                 "severity": sev,
-                "source": "Enhanced-YOLOv8-Vision"
+                "source": "Enhanced-Vision-Spatial"
             })
             logger.info(f"[AI_INSPECT] Added Pothole detection: conf={conf}, box={fbox}, sev={sev}")
 
-    # Priority D: Streetlight or Traffic Signal
-    elif tall_posts and ("light" in hint_str or "street" in hint_str) and not detections:
-        c = max(tall_posts, key=lambda cnt: cv2.boundingRect(cnt)[3])
-        x, y, bw, bh = cv2.boundingRect(c)
-        sbox = [max(5, x - 15), max(5, y - 15), min(w - 5, x + bw + 15), min(h - 5, y + bh + 15)]
-        conf = 0.88
-        detections.append({
-            "label": "CivicVision-Streetlight",
-            "category": "Streetlight",
-            "confidence": conf,
-            "box": [round(float(x), 1) for x in sbox],
-            "areaRatio": round((bw * bh) / float(w * h), 4),
-            "severity": "High",
-            "source": "ComputerVision-FullFrame"
-        })
-        logger.info(f"[AI_INSPECT] Added Streetlight detection: conf={conf}, box={sbox}")
-
-    elif ("signal" in hint_str or "traffic" in hint_str) and not detections:
-        sbox = [int(w * 0.40), int(h * 0.10), int(w * 0.85), int(h * 0.75)]
-        detections.append({
-            "label": "CivicVision-Traffic signal",
-            "category": "Traffic signal",
-            "confidence": 0.88,
-            "box": [round(float(x), 1) for x in sbox],
-            "areaRatio": 0.20,
-            "severity": "Critical",
-            "source": "ComputerVision-FullFrame"
-        })
-        logger.info(f"[AI_INSPECT] Added Traffic signal detection")
-
-    elif "drain" in hint_str and not detections:
-        sbox = [int(w * 0.15), int(h * 0.40), int(w * 0.85), int(h * 0.88)]
-        detections.append({
-            "label": "CivicVision-Drainage",
-            "category": "Drainage",
-            "confidence": 0.88,
-            "box": [round(float(x), 1) for x in sbox],
-            "areaRatio": 0.25,
-            "severity": "High",
-            "source": "ComputerVision-FullFrame"
-        })
-        logger.info(f"[AI_INSPECT] Added Drainage detection")
-
-    # Priority E: Road crack (Structural fractures on asphalt)
-    elif (len(large_cracks) >= 15 or "crack" in hint_str) and not detections:
+    # Priority D: Road Crack on Road Surface
+    elif is_road_scene and len(large_cracks) >= 30 and not detections:
         c = max(large_cracks, key=lambda cnt: cv2.arcLength(cnt, False))
         x, y, bw, bh = cv2.boundingRect(c)
         pad_x = max(10, int(bw * 0.10))
         pad_y = max(8, int(bh * 0.10))
         sbox = [max(5, x - pad_x), max(5, y - pad_y), min(w - 5, x + bw + pad_x), min(h - 5, y + bh + pad_y)]
-        conf = round(min(0.90, max(0.65, 0.60 + min(0.25, len(large_cracks) * 0.005))), 2)
-        sev = "High" if len(large_cracks) > 40 else "Medium"
+        conf = round(min(0.85, max(0.65, 0.60 + min(0.20, len(large_cracks) * 0.004))), 2)
+        area_r = round((bw * bh) / float(w * h), 4)
+        sev = severity_from_detection(area_r, conf, "Road crack")
         detections.append({
             "label": "CivicVision-Road crack",
             "category": "Road crack",
             "confidence": conf,
             "box": [round(float(x), 1) for x in sbox],
-            "areaRatio": round((bw * bh) / float(w * h), 4),
+            "areaRatio": area_r,
             "severity": sev,
             "source": "ComputerVision-FullFrame"
         })
